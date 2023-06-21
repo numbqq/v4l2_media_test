@@ -36,10 +36,10 @@
 
 #include "staticPipe.h"
 #include "ispMgr.h"
-
+#include "lens_config.h"
 
 //#define WDR_ENABLE
-//#define DUAL_CAMERA
+#define DUAL_CAMERA
 #define dump_forever
 
 #define NB_BUFFER                4
@@ -72,9 +72,6 @@ struct thread_info {
 };
 
 pthread_t tid[ARM_V4L2_TEST_STREAM_MAX];
-pthread_mutex_t mutex;
-pthread_cond_t cond;
-
 
 struct ispIF ispIf;
 
@@ -87,6 +84,7 @@ struct thread_param {
     int                          param_buf_length;
     int                          stats_buf_length;
     struct sensorConfig          *sensorCfg;
+    struct lensConfig            *lensCfg;
 
     char                        *mediadevname;
     /* video device info */
@@ -171,7 +169,7 @@ static int getInterface() {
         ERR("dlsym: error:%s", (err_str ? err_str : "unknown"));
         return -1;
     }
-    printf("%s success", __FUNCTION__);
+    INFO("%s success", __FUNCTION__);
     return 0;
 }
 
@@ -239,9 +237,10 @@ void save_img(const char* prefix, void *buff, unsigned int size, int flag, int n
     int fd = -1;
 
     if (buff == NULL || size == 0) {
-        printf("%s:Error input param\n", __func__);
+        ERR("%s:Error input param\n", __func__);
         return;
     }
+
     if (num > 1000)
         return;
 
@@ -256,7 +255,7 @@ void save_img(const char* prefix, void *buff, unsigned int size, int flag, int n
 
     fd = open(name, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
-        printf("%s:Error open file\n", __func__);
+        ERR("%s:Error open file\n", __func__);
         return;
     }
     write(fd, buff, size);
@@ -270,13 +269,13 @@ int get_file_size(char *f_name)
     FILE *fp = NULL;
 
     if (f_name == NULL) {
-        printf("Error file name\n");
+        ERR("Error file name\n");
         return f_size;
     }
 
     fp = fopen(f_name, "rb");
     if (fp == NULL) {
-        printf("Error open file %s\n", f_name);
+        ERR("Error open file %s\n", f_name);
         return f_size;
     }
 
@@ -286,7 +285,7 @@ int get_file_size(char *f_name)
 
     fclose(fp);
 
-    printf("%s: size %d\n", f_name, f_size);
+    INFO("%s: size %d\n", f_name, f_size);
 
     return f_size;
 }
@@ -323,7 +322,7 @@ void isp_param_init(struct media_stream v4l2_media_stream, struct thread_param *
     v4l2_rb.memory = V4L2_MEMORY_MMAP;
     rc = v4l2_video_req_bufs(tparm->v4l2_media_stream.video_stats, &v4l2_rb);
     if (rc < 0) {
-        printf("Error: request buffer.\n");
+        ERR("Error: request buffer.\n");
         return;
     }
 
@@ -345,7 +344,7 @@ void isp_param_init(struct media_stream v4l2_media_stream, struct thread_param *
         v4l2_buf.memory  = V4L2_MEMORY_MMAP;
         rc = v4l2_video_query_buf(tparm->v4l2_media_stream.video_stats, &v4l2_buf);
         if (rc < 0) {
-            printf("Error: query buffer %d.\n", rc);
+            ERR("Error: query buffer %d.\n", rc);
             return;
         }
 
@@ -398,6 +397,12 @@ void isp_param_init(struct media_stream v4l2_media_stream, struct thread_param *
     if (tparm->sensorCfg == nullptr) {
         ERR("Failed to matchSensorConfig");
         return ;
+    }
+
+    tparm->lensCfg = matchLensConfig(&v4l2_media_stream);
+    if (tparm->lensCfg != nullptr) {
+        lens_set_entity(tparm->lensCfg, v4l2_media_stream.lens_ent);
+        lens_control_cb(tparm->lensCfg, &tparm->info.pstAlgCtx.stLensFunc);
     }
 
 #ifdef WDR_ENABLE
@@ -558,11 +563,11 @@ void * video_thread(void *arg)
     v4l2_rb.memory = V4L2_MEMORY_MMAP;
     rc = v4l2_video_req_bufs(tparm->v4l2_media_stream.video_ent0, &v4l2_rb);
     if (rc < 0) {
-        printf("[T#%d] Error: request buffer.\n", stream_type);
+        ERR("[T#%d] Error: request buffer.\n", stream_type);
         return NULL;
     }
 
-    printf("[T#%d] request buf ok\n", stream_type);
+    INFO("[T#%d] request buf ok\n", stream_type);
 
     /* map buffers */
     for (i = 0; i < NB_BUFFER; i++) {
@@ -578,7 +583,7 @@ void * video_thread(void *arg)
         }
         rc = v4l2_video_query_buf(tparm->v4l2_media_stream.video_ent0, &v4l2_buf);
         if (rc < 0) {
-            printf("[T#%d] Error: query buffer %d.\n", stream_type, rc);
+            ERR("[T#%d] Error: query buffer %d.\n", stream_type, rc);
             return NULL;
         }
 
@@ -726,10 +731,7 @@ void * video_thread(void *arg)
 
 
     INFO("[T#%d] media stream stop \n",stream_type);
-    pthread_mutex_lock(&mutex);
-    pthread_cond_wait(&cond, &mutex);
-    printf("stats thread applied the condition\n");
-    pthread_mutex_unlock(&mutex);
+
     /* stream off */
     rc = media_stream_stop(&tparm->v4l2_media_stream, type);
 
@@ -883,7 +885,7 @@ void * stats_thread(void *arg)
 
     } while (tparm->capture_count > 0);
 
-    pthread_cond_signal(&cond);
+
     INFO("[T#%d] media stream stop \n",stream_type);
 
     /* stream off */
@@ -948,16 +950,16 @@ void finishStatsCapture(struct thread_param * tparam) {
 }
 
 void usage(char * prog){
-    printf("%s\n", prog);
-    printf("usage:\n");
-    printf(" example   : ./v4l2_test_raw  -n 100 -m /dev/media0 -p 0 \n");
-    //printf("    f : fmt       : 0: rgb24  1:nv12 \n");
-    printf("    m : media dev name: /dev/media0 or /dev/media1 \n");
-    printf("    p : pipe selection  : 0 1 default 0\n");
-    //printf("    e : exposure value	  : min 1, max 4, default is 1\n");
-    //printf("    b : fbdev			 : default: /dev/fb0\n");
-    printf("    v : videodev		 : default: /dev/video0\n");
-    printf("    n : frame count \n");
+    INFO("%s\n", prog);
+    INFO("usage:\n");
+    INFO(" example   : ./v4l2_test_raw  -n 100 -m /dev/media0 -p 0 \n");
+    //INFO("    f : fmt       : 0: rgb24  1:nv12 \n");
+    INFO("    m : media dev name: /dev/media0 or /dev/media1 \n");
+    INFO("    p : pipe selection  : 0 1 default 0\n");
+    //INFO("    e : exposure value	  : min 1, max 4, default is 1\n");
+    //INFO("    b : fbdev			 : default: /dev/fb0\n");
+    INFO("    v : videodev		 : default: /dev/video0\n");
+    INFO("    n : frame count \n");
 }
 
 /**********
@@ -1164,8 +1166,7 @@ int main(int argc, char *argv[])
     };
 
     sem_init(&tparam_raw.info.p_sem, 0, 0);
-    pthread_mutex_init(&mutex, NULL);
-    pthread_cond_init(&cond, NULL);
+
     /* turn on stats capture stream */
     if (prepareStatsCapture(&tparam_raw) != 0) {
         ERR("Error: Can't start raw stream, cancelling capture.\n");
